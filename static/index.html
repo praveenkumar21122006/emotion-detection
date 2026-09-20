@@ -28,6 +28,7 @@
   .dominant{font-size:28px;font-weight:800;text-transform:capitalize;margin:8px 0}
   .meta{font-size:12px;color:#94a3b8}
   #log{height:120px;overflow:auto;background:#0f172a;border-radius:8px;padding:8px;font-family:monospace;font-size:12px}
+  .warn{color:#f59e0b;font-size:12px;margin-top:8px}
 </style>
 </head>
 <body>
@@ -43,12 +44,14 @@
     </div>
     <div class="controls">
       <button class="primary" id="startBtn">Start Camera</button>
-      <button class="secondary" id="wsBtn">Connect WS</button>
+      <button class="secondary" id="wsBtn">Connect WS (local)</button>
+      <button class="secondary" id="restBtn">Start Detection (REST – Vercel)</button>
       <button class="secondary" id="voiceBtn">Enable Voice</button>
       <button class="danger" id="stopBtn">Stop</button>
       <span class="meta" id="fps">FPS: -</span>
     </div>
-    <div class="meta" style="margin-top:8px">Streams frames at 8 FPS via WebSocket /ws/video. Voice via /ws/audio (16kHz PCM).</div>
+    <div class="warn" id="warn"></div>
+    <div class="meta" style="margin-top:8px">Vercel: uses REST polling (<code>/api/detect/face</code>) – WebSocket only works locally/Render/Fly. Camera requires HTTPS + permission.</div>
     <div id="log"></div>
   </div>
   <div class="card">
@@ -62,10 +65,6 @@
     <div class="dominant" id="voiceDominant" style="font-size:22px">-</div>
     <div class="scores" id="voiceScores"></div>
     <div class="meta" id="voiceFeatures" style="margin-top:8px"></div>
-    <hr style="border-color:#334155;margin:16px 0"/>
-    <div class="meta">Fused (70% face + 30% voice)</div>
-    <div class="dominant" id="fusedDominant" style="font-size:22px">-</div>
-    <div class="scores" id="fusedScores"></div>
   </div>
 </main>
 <script>
@@ -75,17 +74,21 @@ const overlay = document.getElementById('overlay');
 const octx = overlay.getContext('2d');
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
+const warnEl = document.getElementById('warn');
 
 function log(m){
   const d=document.createElement('div');
   d.textContent=new Date().toLocaleTimeString()+" "+m;
   logEl.prepend(d);
+  console.log(m);
 }
+function warn(m){ warnEl.textContent=m; log(m); }
 
 let stream=null;
-let wsVideo=null, wsAudio=null, wsFused=null;
-let sendInterval=null;
+let wsVideo=null, wsAudio=null;
+let sendInterval=null, restInterval=null;
 let audioCtx=null, processor=null;
+let mode='none'; // 'ws' | 'rest'
 
 const dominantEl=document.getElementById('dominant');
 const confEl=document.getElementById('confidence');
@@ -104,49 +107,161 @@ function renderScores(container, scores){
   });
 }
 function updateFaceResult(r){
-  if(r.error){log("face err "+r.error);return;}
+  if(!r || r.error){ log("face err "+(r?.error||'unknown')); return; }
   dominantEl.textContent = r.faces?.[0]?.emotion || "neutral";
   confEl.textContent = "confidence: "+ (r.faces?.[0]?.confidence ?? "-");
-  countEl.textContent = "faces: "+r.count+" | FPS:"+r.fps;
-  fpsEl.textContent="FPS:"+r.fps;
-  statusEl.textContent="streaming";
-  statusEl.style.background="#22c55e";
+  countEl.textContent = "faces: "+r.count+" | FPS:"+ (r.fps||'-');
+  if(r.fps) fpsEl.textContent="FPS:"+r.fps;
+  statusEl.textContent= mode==='rest' ? "REST streaming" : "WS streaming";
+  statusEl.style.background= mode==='rest' ? "#f59e0b" : "#22c55e";
   if(r.faces?.[0]?.scores) renderScores(scoresEl, r.faces[0].scores);
-  // draw boxes
-  overlay.width=video.videoWidth;
-  overlay.height=video.videoHeight;
+  // draw boxes - handle overlay scaling
+  overlay.width=video.videoWidth || 640;
+  overlay.height=video.videoHeight || 480;
   octx.clearRect(0,0,overlay.width,overlay.height);
   (r.faces||[]).forEach(f=>{
     const [x,y,w,h]=f.bbox;
-    const sx=overlay.width/video.videoWidth, sy=overlay.height/video.videoHeight;
-    // Actually bbox is in frame coords same as video, but we map
+    // bbox is in the 320x240 captured frame coords if WS, or original if REST? Both use same frame size as sent (320x240 for WS, 640 for REST? normalize)
+    // We sent 320x240 for WS and 640x480 for REST? Keep simple: scale based on capture size
+    // Our capture canvas is 320x240 for WS, 640x480 for REST - we scale to video size
+    // For simplicity assume bbox relative to captured size, scale to overlay
+    // We'll just scale assuming capture was 320x240 when ws, 320x240 for rest now too
+    const scaleX = overlay.width / 320;
+    const scaleY = overlay.height / 240;
+    // If bbox > 320, then it was full res, adjust
+    const isFullRes = w > 320 || h > 240;
+    const sx = isFullRes ? overlay.width / video.videoWidth : scaleX;
+    const sy = isFullRes ? overlay.height / video.videoHeight : scaleY;
     octx.strokeStyle="#22c55e";octx.lineWidth=2;
     octx.strokeRect(x*sx,y*sy,w*sx,h*sy);
     octx.fillStyle="#22c55e";octx.font="14px sans-serif";
-    octx.fillText(`${f.emotion} ${(f.confidence*100).toFixed(0)}%`, x*sx, (y-6)*sy);
+    octx.fillText(`${f.emotion} ${(f.confidence*100).toFixed(0)}%`, x*sx, Math.max(12,(y-6)*sy));
   });
 }
 
-document.getElementById('startBtn').onclick=async()=>{
-  stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480},audio:false});
-  video.srcObject=stream;
-  log("camera started");
-};
-document.getElementById('stopBtn').onclick=()=>{
-  if(sendInterval) clearInterval(sendInterval);
-  if(wsVideo) wsVideo.close();
-  if(wsAudio) wsAudio.close();
-  if(stream) stream.getTracks().forEach(t=>t.stop());
+async function startCamera(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    warn("getUserMedia not supported. Use HTTPS + modern browser.");
+    return false;
+  }
+  if(!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1"){
+    warn("Camera requires HTTPS. Vercel is HTTPS – ok. Local needs https or localhost.");
+  }
+  try{
+    // Try with ideal constraints, fallback to simple
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:"user"},audio:false});
+    } catch(e){
+      log("Retrying camera with fallback constraints: "+e.message);
+      stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+    }
+    video.srcObject = stream;
+    await video.play().catch(()=>{});
+    // Wait for metadata
+    await new Promise(res=>{
+      if(video.readyState>=1) res();
+      else video.onloadedmetadata = ()=>res();
+    });
+    overlay.width = video.videoWidth || 640;
+    overlay.height = video.videoHeight || 480;
+    statusEl.textContent="camera on"; statusEl.style.background="#0ea5e9";
+    log("camera started "+video.videoWidth+"x"+video.videoHeight);
+    warn("");
+    return true;
+  } catch(e){
+    warn("Camera failed: "+e.name+" – "+e.message+" — Check browser permissions (lock icon) and allow camera.");
+    log("getUserMedia error: "+e.stack);
+    alert("Camera failed: "+e.message+"\n\n1) Click the lock icon in address bar → Allow Camera\n2) Use HTTPS (Vercel is HTTPS)\n3) Try Chrome/Firefox\n4) Close other apps using camera");
+    return false;
+  }
+}
+
+function stopAll(){
+  if(sendInterval) {clearInterval(sendInterval); sendInterval=null;}
+  if(restInterval) {clearInterval(restInterval); restInterval=null;}
+  if(wsVideo) {try{wsVideo.close()}catch{}; wsVideo=null;}
+  if(wsAudio) {try{wsAudio.close()}catch{}; wsAudio=null;}
+  if(processor) {try{processor.disconnect()}catch{}; processor=null;}
+  if(audioCtx) {try{audioCtx.close()}catch{}; audioCtx=null;}
+  if(stream) {stream.getTracks().forEach(t=>t.stop()); stream=null;}
+  video.srcObject=null;
   statusEl.textContent="stopped";statusEl.style.background="#ef4444";
+  mode='none';
   log("stopped");
+}
+
+function startRestLoop(){
+  if(restInterval) clearInterval(restInterval);
+  if(!stream){ warn("Start camera first"); return; }
+  mode='rest';
+  statusEl.textContent="REST streaming"; statusEl.style.background="#f59e0b";
+  log("REST mode: POST /api/detect/face every 400ms (Vercel compatible)");
+  const canvas=document.createElement('canvas');
+  const ctx=canvas.getContext('2d');
+  canvas.width=320; canvas.height=240;
+  let last=performance.now(), frames=0;
+  restInterval=setInterval(async()=>{
+    if(!stream || video.readyState<2) return;
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    const blob = await new Promise(res=>canvas.toBlob(res,'image/jpeg',0.7));
+    if(!blob) return;
+    const fd=new FormData(); fd.append('file', blob, 'frame.jpg');
+    try{
+      const r=await fetch('/api/detect/face', {method:'POST', body:fd});
+      if(!r.ok) throw new Error(r.status+" "+r.statusText);
+      const data=await r.json();
+      frames++;
+      const now=performance.now();
+      if(now-last>1000){ data.fps = Math.round(frames*1000/(now-last)); last=now; frames=0; }
+      updateFaceResult(data);
+    } catch(e){
+      log("REST error: "+e.message);
+      // don't spam
+    }
+  },400);
+}
+
+document.getElementById('startBtn').onclick=async()=>{
+  const ok=await startCamera();
+  if(ok){
+    // Auto-start REST on Vercel, WS locally if available
+    const isVercel = location.hostname.includes('vercel.app');
+    if(isVercel){
+      startRestLoop();
+    } else {
+      // try WS, fallback to REST
+      document.getElementById('wsBtn').click();
+      setTimeout(()=>{
+        if(mode!=='ws') startRestLoop();
+      },1500);
+    }
+  }
+};
+
+document.getElementById('restBtn').onclick=async()=>{
+  if(!stream) {
+    const ok=await startCamera();
+    if(!ok) return;
+  }
+  startRestLoop();
 };
 
 document.getElementById('wsBtn').onclick=()=>{
+  if(!stream){ warn("Start camera first"); return; }
+  if(wsVideo && wsVideo.readyState===1){ log("WS already connected"); return; }
   const proto = location.protocol==="https:"?"wss:":"ws:";
-  wsVideo=new WebSocket(`${proto}//${location.host}/ws/video`);
+  const url=`${proto}//${location.host}/ws/video`;
+  log("Trying WS "+url+" (will fallback to REST if fails in 2s)");
+  try{
+    wsVideo=new WebSocket(url);
+  } catch(e){ log("WS construct failed "+e.message); startRestLoop(); return; }
+  let opened=false;
   wsVideo.onopen=()=>{
-    statusEl.textContent="connected";statusEl.style.background="#0ea5e9";
+    opened=true;
+    mode='ws';
+    statusEl.textContent="WS connected";statusEl.style.background="#22c55e";
     log("WS /ws/video connected");
+    if(restInterval){clearInterval(restInterval); restInterval=null;}
     const canvas=document.createElement('canvas');
     const ctx=canvas.getContext('2d');
     canvas.width=320;canvas.height=240;
@@ -155,60 +270,73 @@ document.getElementById('wsBtn').onclick=()=>{
       ctx.drawImage(video,0,0,canvas.width,canvas.height);
       const b64=canvas.toDataURL('image/jpeg',0.7);
       if(wsVideo.readyState===1) wsVideo.send(JSON.stringify({frame:b64}));
-    },125); // 8 FPS
+    },150);
   };
   wsVideo.onmessage=e=>{
-    try{updateFaceResult(JSON.parse(e.data));}catch{}
+    try{updateFaceResult(JSON.parse(e.data));}catch(err){log("WS parse err")}
   };
-  wsVideo.onclose=()=>{log("WS video closed");clearInterval(sendInterval);};
-  wsVideo.onerror=e=>log("WS error");
-
-  // fused socket demo
-  wsFused=new WebSocket(`${proto}//${location.host}/ws/fused`);
-  wsFused.onmessage=e=>{
-    const r=JSON.parse(e.data);
-    if(r.scores){
-      renderScores(document.getElementById('fusedScores'), r.scores);
-      document.getElementById('fusedDominant').textContent=r.emotion+" "+(r.confidence*100).toFixed(0)+"%";
-    }
-  };
+  wsVideo.onclose=()=>{ log("WS closed"); if(sendInterval){clearInterval(sendInterval); sendInterval=null;} if(!opened){ warn("WS failed (Vercel doesn't support WebSocket) – use REST button"); startRestLoop(); } else { mode='none'; statusEl.textContent="WS closed"; } };
+  wsVideo.onerror=e=>{ log("WS error – falling back to REST"); if(!opened) startRestLoop(); };
+  // fallback timer
+  setTimeout(()=>{ if(!opened && wsVideo && wsVideo.readyState!==1){ log("WS timeout – switching to REST"); startRestLoop(); } },2000);
 };
 
 document.getElementById('voiceBtn').onclick=async()=>{
-  const proto=location.protocol==="https:"?"wss:":"ws:";
-  wsAudio=new WebSocket(`${proto}//${location.host}/ws/audio`);
-  wsAudio.onopen=async()=>{
-    log("WS /ws/audio connected");
-    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
-    const mic=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:16000,channelCount:1,echoCancellation:true}});
-    const src=audioCtx.createMediaStreamSource(mic);
-    const proc=audioCtx.createScriptProcessor(4096,1,1);
-    src.connect(proc);proc.connect(audioCtx.destination);
-    proc.onaudioprocess=e=>{
-      if(wsAudio.readyState!==1) return;
-      const ch=e.inputBuffer.getChannelData(0);
-      // PCM16
-      const pcm=new Int16Array(ch.length);
-      for(let i=0;i<ch.length;i++) pcm[i]=Math.max(-1,Math.min(1,ch[i]))*0x7FFF;
-      const b64=btoa(String.fromCharCode(...new Uint8Array(pcm.buffer)));
-      wsAudio.send(JSON.stringify({audio:b64,sr:16000}));
+  // Voice via REST polling (Vercel compatible) – record 1s chunks and POST to /api/detect/voice
+  try{
+    const mic=await navigator.mediaDevices.getUserMedia({audio:true});
+    const rec = new MediaRecorder(mic, {mimeType: 'audio/webm'});
+    let chunks=[];
+    rec.ondataavailable=e=>{ if(e.data.size>0) chunks.push(e.data); };
+    rec.onstop=async()=>{
+      if(chunks.length===0) { rec.start(); return; }
+      const blob=new Blob(chunks, {type:'audio/webm'});
+      chunks=[];
+      const fd=new FormData(); fd.append('file', blob, 'voice.webm');
+      try{
+        const r=await fetch('/api/detect/voice', {method:'POST', body:fd});
+        const data=await r.json();
+        if(data.scores){
+          renderScores(document.getElementById('voiceScores'), data.scores);
+          document.getElementById('voiceDominant').textContent=data.emotion+" "+(data.confidence*100).toFixed(0)+"%";
+          document.getElementById('voiceFeatures').textContent=JSON.stringify(data.features||{});
+        }
+      } catch(e){ log("voice REST err "+e.message); }
+      // continue loop
+      setTimeout(()=>{ if(rec.state==='inactive') rec.start(); }, 800);
     };
-    processor=proc;
-  };
-  wsAudio.onmessage=e=>{
-    const r=JSON.parse(e.data);
-    if(r.scores){
-      renderScores(document.getElementById('voiceScores'), r.scores);
-      document.getElementById('voiceDominant').textContent=r.emotion+" "+(r.confidence*100).toFixed(0)+"%";
-      document.getElementById('voiceFeatures').textContent=JSON.stringify(r.features||{});
-    }
-  };
+    rec.start();
+    setTimeout(()=>{ if(rec.state==='recording') rec.stop(); }, 1200);
+    const interval=setInterval(()=>{
+      if(rec.state==='recording') rec.stop();
+    }, 1500);
+    // stop on page unload
+    document.getElementById('stopBtn').addEventListener('click', ()=>{
+      clearInterval(interval); try{rec.stop()}catch{}; mic.getTracks().forEach(t=>t.stop());
+    }, {once:true});
+    log("Voice REST polling started (POST /api/detect/voice every 1.5s)");
+  } catch(e){
+    warn("Mic failed: "+e.message);
+  }
 };
+
+document.getElementById('stopBtn').onclick=stopAll;
+
+// Auto-check secure context
+if(!window.isSecureContext){
+  warn("Not secure context – camera may be blocked. Use HTTPS or localhost.");
+}
+if(!navigator.mediaDevices){
+  warn("navigator.mediaDevices unavailable – update browser.");
+}
 
 // init empty bars
 renderScores(scoresEl, Object.fromEntries(EMOTIONS.map(e=>[e,0])));
 renderScores(document.getElementById('voiceScores'), Object.fromEntries(EMOTIONS.map(e=>[e,0])));
-renderScores(document.getElementById('fusedScores'), Object.fromEntries(EMOTIONS.map(e=>[e,0])));
+
+// Log env
+log("Host: "+location.host+" | Secure: "+window.isSecureContext+" | Protocol: "+location.protocol);
+if(location.hostname.includes('vercel.app')) log("Vercel detected – REST mode recommended");
 </script>
 </body>
 </html>
