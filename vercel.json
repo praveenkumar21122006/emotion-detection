@@ -1,4 +1,13 @@
 {
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "type": "service",
+        "service": "emotion-detection"
+      }
+    }
+  ],
   "services": {
     "emotion-detection": {
       "root": ".",
