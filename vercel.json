@@ -1,9 +1,8 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
   "services": {
     "emotion-detection": {
       "root": ".",
-      "entrypoint": "api/index.py"
+      "entrypoint": "app/main.py"
     }
   }
 }
