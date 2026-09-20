@@ -1,15 +1,9 @@
 fastapi==0.141.1
 uvicorn[standard]==0.37.0
-opencv-python==5.0.0.93
-numpy==2.5.3
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
 pillow>=10.0.0
 websockets>=12.0
 python-multipart>=0.0.9
-# Optional but recommended for higher accuracy:
-# deepface>=0.0.93
-# librosa>=0.11.0
-# tensorflow>=2.15.0
-# torch>=2.2.0
-# transformers>=4.40.0
 librosa>=0.11.0
 soundfile>=0.12.1
