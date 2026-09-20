@@ -2,8 +2,7 @@
   "services": {
     "emotion-detection": {
       "root": ".",
-      "entrypoint": "app/main.py",
-      "framework": "fastapi"
+      "entrypoint": "main.py"
     }
   }
 }
