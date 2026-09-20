@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Real-Time Emotion Detection</title>
+<style>
+  *{box-sizing:border-box;font-family:Inter,system-ui,sans-serif}
+  body{margin:0;background:#0f172a;color:#e2e8f0;display:flex;flex-direction:column;min-height:100vh}
+  header{padding:16px 24px;background:#1e293b;display:flex;justify-content:space-between;align-items:center}
+  header h1{margin:0;font-size:20px}
+  .badge{padding:4px 10px;border-radius:999px;background:#0ea5e9;color:white;font-size:12px}
+  main{display:grid;grid-template-columns:1.2fr 0.8fr;gap:16px;padding:16px;flex:1}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .card{background:#1e293b;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.3)}
+  video,canvas{width:100%;border-radius:12px;background:#000;max-height:420px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  button{padding:10px 16px;border-radius:10px;border:0;cursor:pointer;font-weight:600}
+  .primary{background:#0ea5e9;color:white}
+  .secondary{background:#334155;color:#e2e8f0}
+  .danger{background:#ef4444;color:white}
+  .scores{display:grid;gap:8px;margin-top:12px}
+  .score{display:flex;align-items:center;gap:8px}
+  .bar{flex:1;height:10px;background:#334155;border-radius:999px;overflow:hidden}
+  .fill{height:100%;background:linear-gradient(90deg,#0ea5e9,#22d3ee);transition:width .3s}
+  .label{width:80px;font-size:13px;text-transform:capitalize}
+  .val{width:40px;text-align:right;font-size:13px}
+  .dominant{font-size:28px;font-weight:800;text-transform:capitalize;margin:8px 0}
+  .meta{font-size:12px;color:#94a3b8}
+  #log{height:120px;overflow:auto;background:#0f172a;border-radius:8px;padding:8px;font-family:monospace;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎭 Real-Time Emotion Detection <span style="font-weight:400;font-size:13px;color:#94a3b8"> — Facial + Voice Modulation</span></h1>
+  <span class="badge" id="status">disconnected</span>
+</header>
+<main>
+  <div class="card">
+    <div style="position:relative">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="overlay" style="position:absolute;left:0;top:0;pointer-events:none"></canvas>
+    </div>
+    <div class="controls">
+      <button class="primary" id="startBtn">Start Camera</button>
+      <button class="secondary" id="wsBtn">Connect WS</button>
+      <button class="secondary" id="voiceBtn">Enable Voice</button>
+      <button class="danger" id="stopBtn">Stop</button>
+      <span class="meta" id="fps">FPS: -</span>
+    </div>
+    <div class="meta" style="margin-top:8px">Streams frames at 8 FPS via WebSocket /ws/video. Voice via /ws/audio (16kHz PCM).</div>
+    <div id="log"></div>
+  </div>
+  <div class="card">
+    <div class="meta">Dominant Emotion</div>
+    <div class="dominant" id="dominant">neutral</div>
+    <div class="meta" id="confidence">confidence: -</div>
+    <div class="meta" id="count">faces: 0</div>
+    <div class="scores" id="scores"></div>
+    <hr style="border-color:#334155;margin:16px 0"/>
+    <div class="meta">Voice Emotion</div>
+    <div class="dominant" id="voiceDominant" style="font-size:22px">-</div>
+    <div class="scores" id="voiceScores"></div>
+    <div class="meta" id="voiceFeatures" style="margin-top:8px"></div>
+    <hr style="border-color:#334155;margin:16px 0"/>
+    <div class="meta">Fused (70% face + 30% voice)</div>
+    <div class="dominant" id="fusedDominant" style="font-size:22px">-</div>
+    <div class="scores" id="fusedScores"></div>
+  </div>
+</main>
+<script>
+const EMOTIONS = ["angry","disgust","fear","happy","sad","surprise","neutral"];
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const octx = overlay.getContext('2d');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+
+function log(m){
+  const d=document.createElement('div');
+  d.textContent=new Date().toLocaleTimeString()+" "+m;
+  logEl.prepend(d);
+}
+
+let stream=null;
+let wsVideo=null, wsAudio=null, wsFused=null;
+let sendInterval=null;
+let audioCtx=null, processor=null;
+
+const dominantEl=document.getElementById('dominant');
+const confEl=document.getElementById('confidence');
+const countEl=document.getElementById('count');
+const scoresEl=document.getElementById('scores');
+const fpsEl=document.getElementById('fps');
+
+function renderScores(container, scores){
+  container.innerHTML="";
+  EMOTIONS.forEach(e=>{
+    const v = scores[e] ?? 0;
+    const row=document.createElement('div');
+    row.className="score";
+    row.innerHTML=`<span class="label">${e}</span><div class="bar"><div class="fill" style="width:${(v*100).toFixed(1)}%"></div></div><span class="val">${(v*100).toFixed(0)}%</span>`;
+    container.appendChild(row);
+  });
+}
+function updateFaceResult(r){
+  if(r.error){log("face err "+r.error);return;}
+  dominantEl.textContent = r.faces?.[0]?.emotion || "neutral";
+  confEl.textContent = "confidence: "+ (r.faces?.[0]?.confidence ?? "-");
+  countEl.textContent = "faces: "+r.count+" | FPS:"+r.fps;
+  fpsEl.textContent="FPS:"+r.fps;
+  statusEl.textContent="streaming";
+  statusEl.style.background="#22c55e";
+  if(r.faces?.[0]?.scores) renderScores(scoresEl, r.faces[0].scores);
+  // draw boxes
+  overlay.width=video.videoWidth;
+  overlay.height=video.videoHeight;
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  (r.faces||[]).forEach(f=>{
+    const [x,y,w,h]=f.bbox;
+    const sx=overlay.width/video.videoWidth, sy=overlay.height/video.videoHeight;
+    // Actually bbox is in frame coords same as video, but we map
+    octx.strokeStyle="#22c55e";octx.lineWidth=2;
+    octx.strokeRect(x*sx,y*sy,w*sx,h*sy);
+    octx.fillStyle="#22c55e";octx.font="14px sans-serif";
+    octx.fillText(`${f.emotion} ${(f.confidence*100).toFixed(0)}%`, x*sx, (y-6)*sy);
+  });
+}
+
+document.getElementById('startBtn').onclick=async()=>{
+  stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480},audio:false});
+  video.srcObject=stream;
+  log("camera started");
+};
+document.getElementById('stopBtn').onclick=()=>{
+  if(sendInterval) clearInterval(sendInterval);
+  if(wsVideo) wsVideo.close();
+  if(wsAudio) wsAudio.close();
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  statusEl.textContent="stopped";statusEl.style.background="#ef4444";
+  log("stopped");
+};
+
+document.getElementById('wsBtn').onclick=()=>{
+  const proto = location.protocol==="https:"?"wss:":"ws:";
+  wsVideo=new WebSocket(`${proto}//${location.host}/ws/video`);
+  wsVideo.onopen=()=>{
+    statusEl.textContent="connected";statusEl.style.background="#0ea5e9";
+    log("WS /ws/video connected");
+    const canvas=document.createElement('canvas');
+    const ctx=canvas.getContext('2d');
+    canvas.width=320;canvas.height=240;
+    sendInterval=setInterval(()=>{
+      if(video.readyState<2) return;
+      ctx.drawImage(video,0,0,canvas.width,canvas.height);
+      const b64=canvas.toDataURL('image/jpeg',0.7);
+      if(wsVideo.readyState===1) wsVideo.send(JSON.stringify({frame:b64}));
+    },125); // 8 FPS
+  };
+  wsVideo.onmessage=e=>{
+    try{updateFaceResult(JSON.parse(e.data));}catch{}
+  };
+  wsVideo.onclose=()=>{log("WS video closed");clearInterval(sendInterval);};
+  wsVideo.onerror=e=>log("WS error");
+
+  // fused socket demo
+  wsFused=new WebSocket(`${proto}//${location.host}/ws/fused`);
+  wsFused.onmessage=e=>{
+    const r=JSON.parse(e.data);
+    if(r.scores){
+      renderScores(document.getElementById('fusedScores'), r.scores);
+      document.getElementById('fusedDominant').textContent=r.emotion+" "+(r.confidence*100).toFixed(0)+"%";
+    }
+  };
+};
+
+document.getElementById('voiceBtn').onclick=async()=>{
+  const proto=location.protocol==="https:"?"wss:":"ws:";
+  wsAudio=new WebSocket(`${proto}//${location.host}/ws/audio`);
+  wsAudio.onopen=async()=>{
+    log("WS /ws/audio connected");
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+    const mic=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:16000,channelCount:1,echoCancellation:true}});
+    const src=audioCtx.createMediaStreamSource(mic);
+    const proc=audioCtx.createScriptProcessor(4096,1,1);
+    src.connect(proc);proc.connect(audioCtx.destination);
+    proc.onaudioprocess=e=>{
+      if(wsAudio.readyState!==1) return;
+      const ch=e.inputBuffer.getChannelData(0);
+      // PCM16
+      const pcm=new Int16Array(ch.length);
+      for(let i=0;i<ch.length;i++) pcm[i]=Math.max(-1,Math.min(1,ch[i]))*0x7FFF;
+      const b64=btoa(String.fromCharCode(...new Uint8Array(pcm.buffer)));
+      wsAudio.send(JSON.stringify({audio:b64,sr:16000}));
+    };
+    processor=proc;
+  };
+  wsAudio.onmessage=e=>{
+    const r=JSON.parse(e.data);
+    if(r.scores){
+      renderScores(document.getElementById('voiceScores'), r.scores);
+      document.getElementById('voiceDominant').textContent=r.emotion+" "+(r.confidence*100).toFixed(0)+"%";
+      document.getElementById('voiceFeatures').textContent=JSON.stringify(r.features||{});
+    }
+  };
+};
+
+// init empty bars
+renderScores(scoresEl, Object.fromEntries(EMOTIONS.map(e=>[e,0])));
+renderScores(document.getElementById('voiceScores'), Object.fromEntries(EMOTIONS.map(e=>[e,0])));
+renderScores(document.getElementById('fusedScores'), Object.fromEntries(EMOTIONS.map(e=>[e,0])));
+</script>
+</body>
+</html>
