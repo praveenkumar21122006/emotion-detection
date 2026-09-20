@@ -1,4 +1,10 @@
+[![Deploy](https://github.com/praveenkumar21122006/emotion-detection/actions/workflows/deploy.yml/badge.svg)](https://github.com/praveenkumar21122006/emotion-detection/actions)
+
 # Real-Time Emotion Detection System
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/praveenkumar21122006/emotion-detection)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/praveenkumar21122006/emotion-detection)
+
 
 Evaluates **facial expressions** and **voice modulations** during live video streams. Fusion gives a robust emotion estimate.
 
