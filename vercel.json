@@ -1,8 +1,0 @@
-{
-  "services": {
-    "emotion-detection": {
-      "root": ".",
-      "entrypoint": "app/main.py"
-    }
-  }
-}
